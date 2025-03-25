@@ -6,21 +6,17 @@
 #include "arduinoFFT.h"
 #include "freertos/queue.h"
 
-#define OUTPUT_READABLE_YAWPITCHROLL
 #define EARTH_GRAVITY_MS2 9.80665
 
-#define SAMPLES 64
-#define SAMPLING_FREQUENCY 1000
+#define SAMPLES 4096
+#define SAMPLING_FREQUENCY 50
 
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 MPU6050 mpu;
 
-
 double vReal[SAMPLES];
 double vImag[SAMPLES];
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
-
-xQueueHandle dataVibration_Queue = NULL;
 
 int const INTERRUPT_PIN = 2; // Define the interruption #0 pin
 bool blinkState;
@@ -30,30 +26,29 @@ uint8_t MPUIntStatus;
 uint8_t devStatus;
 uint16_t packetSize;
 uint8_t FIFOBuffer[64];
+uint32_t nextSampleTime;
 
 Quaternion q;
 VectorInt16 aa;
 VectorInt16 gy;
 VectorInt16 aaWorld;
 VectorFloat gravity;
+VectorInt16 aaReal;
 volatile bool MPUInterrupt = false;
-float gFactor = 2000.0 / 32767.0;
 
 void DMPDataReady()
 {
   MPUInterrupt = true;
 }
 void readIMU(void *pvParameters);
-void FFT_Processing(void *pvParameters);
 
 void setup()
 {
+  Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000);
-  Serial.begin(115200);
 
   mpu.initialize();
-  Serial.println(mpu.getRate());
   pinMode(INTERRUPT_PIN, INPUT);
   pinMode(LED_BUILTIN, OUTPUT);
 
@@ -80,7 +75,7 @@ void setup()
   {
     mpu.CalibrateAccel(6);
     mpu.CalibrateGyro(6);
-    mpu.PrintActiveOffsets();
+    // mpu.PrintActiveOffsets();
     mpu.setDMPEnabled(true);
     attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), DMPDataReady, RISING);
     MPUIntStatus = mpu.getIntStatus();
@@ -94,10 +89,9 @@ void setup()
     Serial.println(F(")"));
   }
 
-  dataVibration_Queue = xQueueCreate(10, sizeof(float));
-
   xTaskCreatePinnedToCore(readIMU, "readIMU", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(FFT_Processing, "FFT_Processing", 4096, NULL, 1, NULL, 1);
+
+  nextSampleTime = micros();
 }
 
 void loop()
@@ -106,46 +100,44 @@ void loop()
 
 void readIMU(void *pvParameters)
 {
+  float vibration = 0;
   for (;;)
   {
-    if (!DMPReady) return;
+    if (!DMPReady)
+      continue;
 
-    
-    if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer)) {
-      mpu.dmpGetQuaternion(&q, FIFOBuffer);
-      mpu.dmpGetGravity(&gravity, &q);
-      mpu.dmpGetAccel(&aa, FIFOBuffer);
-      mpu.dmpConvertToWorldFrame(&aaWorld, &aa, &q);
+    for (int i = 0; i < SAMPLES; i++)
+    {
 
-      float X_Accel = aaWorld.x * mpu.get_acce_resolution() * EARTH_GRAVITY_MS2;
-      float Y_Accel = aaWorld.y * mpu.get_acce_resolution() * EARTH_GRAVITY_MS2;
-      float Z_Accel = aaWorld.z * mpu.get_acce_resolution() * EARTH_GRAVITY_MS2;
-
-      float vibration = sqrt(pow(X_Accel, 2) + pow(Y_Accel, 2) + pow(Z_Accel, 2));
-      xQueueSend(dataVibration_Queue, &vibration, 0);
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-}
-
-void FFT_Processing(void *pvParamters){
-
-  float vibration;
-  for(;;) {
-    if(xQueueReceive(dataVibration_Queue, &vibration, portMAX_DELAY) == pdTRUE) {
-      for(int i = 0; i < SAMPLES; i++) {
+      if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer))
+      {
+        mpu.dmpGetQuaternion(&q, FIFOBuffer);
+        mpu.dmpGetAccel(&aa, FIFOBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+        
+        float X_Accel = aaReal.x * mpu.get_acce_resolution();
+        float Y_Accel = aaReal.y * mpu.get_acce_resolution();
+        
+        vibration = sqrt(X_Accel * X_Accel + Y_Accel * Y_Accel);
         vReal[i] = vibration;
         vImag[i] = 0;
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+      } else {
+        i--;
       }
     }
 
+    FFT.dcRemoval();
     FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
     FFT.compute(FFT_FORWARD);
     FFT.complexToMagnitude();
-    
-    float peak = FFT.majorPeak();
-    Serial.println(peak, 6);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+
+    for (int i = 1; i < (SAMPLES / 2); i++)
+    {
+      double freq = (i * SAMPLING_FREQUENCY) / SAMPLES;
+      Serial.printf("%f\n", vReal[i]);
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
