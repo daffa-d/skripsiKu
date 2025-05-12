@@ -47,6 +47,7 @@ QueueHandle_t Queue_dataToF;
 QueueHandle_t Queue_dataFFT;
 int const INTERRUPT_PIN = 10; // Define the interruption #0 pin
 bool blinkState;
+char buff[50];
 
 typedef struct
 {
@@ -89,8 +90,9 @@ void DMPDataReady()
   MPUInterrupt = true;
 }
 
-String klasifikasiKeausan(double rms, double maxFFT);
+String klasifikasiKeausan(double rms, double maxFFT, float arus, float tof);
 void movingAverage(double *input, double *output, int len, int windowSize);
+bool isGetaranValid(double *spectrum, int size, double freqResolution);
 void readIMU(void *pvParameter);
 void readPZEM(void *pvParameter);
 void readToF(void *pvParameter);
@@ -121,6 +123,11 @@ void setup()
   if (!tof.begin(TOF_Sensor_ADDR, false, &Peripheral_Sensor))
   {
     Serial.println("ToF not found. Check wiring!");
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(0, 10);
+    display.println("ToF ERR....");
+    display.display();
   }
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
@@ -141,10 +148,8 @@ void setup()
       Serial.printf("Restart in %d seconds...\n", 3 - i);
       display.setTextSize(1);
       display.setTextColor(SH110X_WHITE);
-      display.setCursor(0, 40);
-      display.println("Restart in...");
-      display.setCursor(40, 50);
-      display.print(3 - i);
+      display.setCursor(0, 30);
+      display.println("Restart ESP...");
       display.display();
       vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
@@ -205,16 +210,19 @@ void setup()
   }
   vTaskDelay(2000 / portTICK_PERIOD_MS);
   pinMode(LED_BUILTIN, OUTPUT);
-  esp_task_wdt_init(10, true);
+  esp_task_wdt_deinit();
+  esp_task_wdt_init(50, true);
 
   Queue_dataPzem = xQueueCreate(10, sizeof(dataPzem));
   Queue_dataToF = xQueueCreate(2, sizeof(float));
   Queue_dataFFT = xQueueCreate(2, sizeof(dataFFT));
 
-  xTaskCreatePinnedToCore(readPZEM, "readPZEM", 4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(readToF, "readToF", 4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(readIMU, "readIMU", 8192, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(screenDisplay, "screenDisplay", 8192, NULL, 1, NULL, 0);
+  Serial.printf("Tegangan: %.2f | Arus: %.2f | Power: %.2f | ToF: %.2f | RMS: %.2f | Max FFT: %.2f | Status: %s\n", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "OK");
+
+  xTaskCreatePinnedToCore(readPZEM, "readPZEM", 4096, NULL, 0, NULL, 1);
+  xTaskCreatePinnedToCore(readToF, "readToF", 4096, NULL, 0, NULL, 1);
+  xTaskCreatePinnedToCore(readIMU, "readIMU", 16384, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(screenDisplay, "screenDisplay", 8192, NULL, 0, NULL, 0);
 }
 
 void loop()
@@ -228,11 +236,13 @@ void screenDisplay(void *pvParameter)
   dataFFT datFFT;
   char buff[50];
   float distance;
+  esp_task_wdt_add(NULL);
   for (;;)
   {
     xQueueReceive(Queue_dataPzem, &datEnergy, 0);
     xQueueReceive(Queue_dataToF, &distance, 0);
     xQueueReceive(Queue_dataFFT, &datFFT, 0);
+    esp_task_wdt_reset();
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SH110X_WHITE);
@@ -265,6 +275,9 @@ void screenDisplay(void *pvParameter)
     display.print("Klasifikasi: ");
     display.println(datFFT.KlasifikasiStatus);
     display.display();
+    // Serial.printf("Tegangan: %.2f | Arus: %.2f |Power: %.2f | ToF: %.2f | RMS: %.2f | Max FFT: %.2f | Status: %s\n", datEnergy.voltage, datEnergy.current, datEnergy.power, distance / 10, datFFT.rmsAmplitude, datFFT.maxAmplitude, datFFT.KlasifikasiStatus.c_str());
+    Serial.printf("%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %s\n", datEnergy.voltage, datEnergy.current, datEnergy.power, distance / 10, datFFT.rmsAmplitude, datFFT.maxAmplitude, datFFT.KlasifikasiStatus.c_str());
+    esp_task_wdt_reset();
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
@@ -273,13 +286,24 @@ void readPZEM(void *pvParameter)
 {
   dataPzem dat;
   digitalWrite(SSR, HIGH);
+  esp_task_wdt_add(NULL);
   for (;;)
   {
+    esp_task_wdt_reset();
     dat.voltage = isnan(pzem.voltage()) ? 0 : pzem.voltage();
     dat.current = isnan(pzem.current()) ? 0 : pzem.current();
     dat.power = isnan(pzem.power()) ? 0 : pzem.power();
     dat.frequency = isnan(pzem.frequency()) ? 0 : pzem.frequency();
+    if (dat.voltage > 300)
+      dat.voltage = 0;
+    if (dat.current > 100)
+      dat.current = 0;
+    if (dat.power > 30000)
+      dat.power = 0;
+    if (dat.frequency > 60)
+      dat.frequency = 0;
     xQueueSend(Queue_dataPzem, &dat, portMAX_DELAY);
+    esp_task_wdt_reset();
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
@@ -288,19 +312,29 @@ void readToF(void *pvParameter)
 {
   VL53L0X_RangingMeasurementData_t measure;
   float distance;
+  esp_task_wdt_add(NULL);
   for (;;)
   {
-    
-      tof.rangingTest(&measure, false);
-      if (measure.RangeStatus != 4)
-      {
-        distance = measure.RangeMilliMeter;
-      }
-      else
-      {
-        distance = 0;
-      }
-      xQueueSend(Queue_dataToF, &distance, 0);
+    esp_task_wdt_reset();
+    taskYIELD();
+    tof.rangingTest(&measure, false);
+    if (measure.RangeStatus != 4)
+    {
+      distance = measure.RangeMilliMeter;
+    }
+    else
+    {
+      distance = 0;
+    }
+
+    if (distance < 0)
+      distance = 0;
+    else if (distance > 2000)
+      distance = 0;
+    else
+      distance = measure.RangeMilliMeter;
+    xQueueSend(Queue_dataToF, &distance, 0);
+    esp_task_wdt_reset();
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
@@ -309,16 +343,20 @@ void readIMU(void *pvParameter)
 {
   int errorRetry = 0;
   dataFFT dat;
+  dataPzem datEnergy;
+  float distance;
+  double smoothed[SAMPLES / 2];
   esp_task_wdt_add(NULL);
   for (;;)
   {
-    previousMicros = micros();
+    previousMicros = esp_timer_get_time();
     for (int i = 0; i < SAMPLES; i++)
     {
       if (!DMPReady)
         return; // Stop the program if DMP programming fails.
 
       /* Read a packet from FIFO */
+      taskYIELD();
       if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer))
       {
         mpu.dmpGetQuaternion(&q, FIFOBuffer);
@@ -335,54 +373,68 @@ void readIMU(void *pvParameter)
       if (errorRetry > 10)
         ESP.restart();
 
-      vReal[i] = accelx_ms2;
+      vReal[i] = fabs(accelx_ms2);
       vImag[i] = 0.0;
 
-      while (micros() - previousMicros < (interval / SAMPLING_FREQUENCY))
+      while (esp_timer_get_time() - previousMicros < (interval / SAMPLING_FREQUENCY))
         ;
-      previousMicros = micros();
+      previousMicros = esp_timer_get_time();
     }
 
+    esp_task_wdt_reset();
     FFT.dcRemoval();
     FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
     FFT.compute(FFT_FORWARD);
     FFT.complexToMagnitude();
 
-    double frequency;
-    double max_amplitude = 0;
+    double rms = 0;
+    for (int i = 0; i < SAMPLES; i++)
+      rms += vReal[i] * vReal[i];
+    rms = sqrt(rms / SAMPLES);
+
+    double freqResolution = (double)SAMPLING_FREQUENCY / SAMPLES;
+    if (!isGetaranValid(vReal, SAMPLES / 2, freqResolution))
+    {
+      // Serial.println("Getaran tidak valid (gerakan tangan)");
+      // vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    esp_task_wdt_reset();
+    int windowSize = (rms < 5) ? 5 : (rms < 15) ? 7
+                                                : 9;
+    if (windowSize % 2 == 0)
+      windowSize++;
+    movingAverage(vReal, smoothed, SAMPLES / 2, windowSize);
+
+    double maxFFT = 0;
     for (int i = 0; i < SAMPLES / 2; i++)
     {
-      frequency = (i * SAMPLING_FREQUENCY) / SAMPLES;
-      if (vReal[i] > max_amplitude)
-        max_amplitude = vReal[i];
+      if (smoothed[i] > maxFFT)
+        maxFFT = smoothed[i];
     }
 
-    double sumSq = 0;
-    for (int i = 0; i < SAMPLES; i++)
-    {
-      sumSq += vReal[i] * vReal[i];
-    }
-    double rms = sqrt(sumSq / SAMPLES);
-
-    Serial.printf("%.2f, %.2f, %s\n", rms, max_amplitude, klasifikasiKeausan(rms, max_amplitude).c_str());
-    dat.maxAmplitude = max_amplitude;
+    xQueueReceive(Queue_dataPzem, &datEnergy, 0);
+    xQueueReceive(Queue_dataToF, &distance, 0);
+    String status = klasifikasiKeausan(rms, maxFFT, datEnergy.current, distance);
+    // Serial.printf("RMS: %.2f | Max FFT: %.2f | Status: %s\n", rms, maxFFT, status.c_str());
+    dat.KlasifikasiStatus = status;
+    dat.maxAmplitude = maxFFT;
     dat.rmsAmplitude = rms;
-    dat.KlasifikasiStatus = klasifikasiKeausan(rms, max_amplitude);
     xQueueSend(Queue_dataFFT, &dat, 0);
     esp_task_wdt_reset();
     vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 }
 
-String klasifikasiKeausan(double rms, double maxFFT)
+String klasifikasiKeausan(double rms, double maxFFT, float arus, float tof)
 {
-  if (rms < 17.0 && maxFFT < 350)
-  {
-    return "Normal";
-  }
-  else
-  {
-    return "Aus";
+  if (arus < 1.6 && tof > 17) {
+    return "Idle";
+  } else if (rms < 30.0 && maxFFT < 800.0) {
+    return "Normal"; 
+  } else {
+    return "Aus"; 
   }
 }
 
@@ -404,4 +456,19 @@ void movingAverage(double *input, double *output, int len, int windowSize)
     }
     output[i] = sum / count;
   }
+}
+
+bool isGetaranValid(double *spectrum, int size, double freqResolution)
+{
+  double lowEnergy = 0;
+  double highEnergy = 0;
+  for (int i = 0; i < size; i++)
+  {
+    double freq = i * freqResolution;
+    if (freq >= 0 && freq < 10)
+      lowEnergy += spectrum[i];
+    else if (freq >= 20 && freq <= 300)
+      highEnergy += spectrum[i];
+  }
+  return (highEnergy > lowEnergy * 2);
 }
