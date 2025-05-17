@@ -10,6 +10,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
+#include "random.h"
 
 // I2C
 #define Peripheral_Sensor_SDA 38
@@ -22,7 +23,7 @@
 // FFT Vibration
 #define EARTH_GRAVITY_MS2 9.80665
 #define SAMPLES 1024
-#define SAMPLING_FREQUENCY 1000
+#define SAMPLING_FREQUENCY 500
 // Pzem
 #define PZEM_RX 18
 #define PZEM_TX 17
@@ -40,11 +41,17 @@ Adafruit_VL53L0X tof = Adafruit_VL53L0X();
 
 double vReal[SAMPLES];
 double vImag[SAMPLES];
+double vRealFFT[SAMPLES];
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
 
 QueueHandle_t Queue_dataPzem;
 QueueHandle_t Queue_dataToF;
 QueueHandle_t Queue_dataFFT;
+QueueHandle_t Queue_Vreal;
+
+const int START_BIN = 5;
+const int END_BIN = 50;
+double feature[END_BIN - START_BIN + 1];
 int const INTERRUPT_PIN = 10; // Define the interruption #0 pin
 bool blinkState;
 char buff[50];
@@ -106,7 +113,6 @@ void setup()
   Serial.begin(115200);
   while (!Serial)
     ;
-
   display.begin(i2c_Address, true);
   display.clearDisplay();
   display.setTextSize(1);
@@ -216,12 +222,11 @@ void setup()
   Queue_dataPzem = xQueueCreate(10, sizeof(dataPzem));
   Queue_dataToF = xQueueCreate(2, sizeof(float));
   Queue_dataFFT = xQueueCreate(2, sizeof(dataFFT));
-
-  Serial.printf("Tegangan: %.2f | Arus: %.2f | Power: %.2f | ToF: %.2f | RMS: %.2f | Max FFT: %.2f | Status: %s\n", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "OK");
+  Queue_Vreal = xQueueCreate(2, sizeof(feature));
 
   xTaskCreatePinnedToCore(readPZEM, "readPZEM", 4096, NULL, 0, NULL, 1);
   xTaskCreatePinnedToCore(readToF, "readToF", 4096, NULL, 0, NULL, 1);
-  xTaskCreatePinnedToCore(readIMU, "readIMU", 16384, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(readIMU, "readIMU", 8192, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(screenDisplay, "screenDisplay", 8192, NULL, 0, NULL, 0);
 }
 
@@ -242,6 +247,7 @@ void screenDisplay(void *pvParameter)
     xQueueReceive(Queue_dataPzem, &datEnergy, 0);
     xQueueReceive(Queue_dataToF, &distance, 0);
     xQueueReceive(Queue_dataFFT, &datFFT, 0);
+    xQueueReceive(Queue_Vreal, &feature, 0);
     esp_task_wdt_reset();
     display.clearDisplay();
     display.setTextSize(1);
@@ -276,9 +282,14 @@ void screenDisplay(void *pvParameter)
     display.println(datFFT.KlasifikasiStatus);
     display.display();
     // Serial.printf("Tegangan: %.2f | Arus: %.2f |Power: %.2f | ToF: %.2f | RMS: %.2f | Max FFT: %.2f | Status: %s\n", datEnergy.voltage, datEnergy.current, datEnergy.power, distance / 10, datFFT.rmsAmplitude, datFFT.maxAmplitude, datFFT.KlasifikasiStatus.c_str());
-    Serial.printf("%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %s\n", datEnergy.voltage, datEnergy.current, datEnergy.power, distance / 10, datFFT.rmsAmplitude, datFFT.maxAmplitude, datFFT.KlasifikasiStatus.c_str());
+    // Serial.printf("%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, ", datEnergy.voltage, datEnergy.current, datEnergy.power, distance / 10, datFFT.rmsAmplitude, datFFT.maxAmplitude);
+    // for (int i = START_BIN; i <= END_BIN; i++)
+    // {
+    //   Serial.printf("%.2f, ", feature[i - START_BIN]);
+    // }
+    // Serial.printf("\n");
     esp_task_wdt_reset();
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
@@ -414,13 +425,31 @@ void readIMU(void *pvParameter)
         maxFFT = smoothed[i];
     }
 
+    // for (int i = START_BIN; i <= END_BIN; i++)
+    // {
+    //   feature[i - START_BIN] = smoothed[i];
+    // }
     xQueueReceive(Queue_dataPzem, &datEnergy, 0);
     xQueueReceive(Queue_dataToF, &distance, 0);
-    String status = klasifikasiKeausan(rms, maxFFT, datEnergy.current, distance);
-    // Serial.printf("RMS: %.2f | Max FFT: %.2f | Status: %s\n", rms, maxFFT, status.c_str());
-    dat.KlasifikasiStatus = status;
+    // String status = klasifikasiKeausan(rms, maxFFT, datEnergy.current, distance);
+    // dat.KlasifikasiStatus = status;
     dat.maxAmplitude = maxFFT;
     dat.rmsAmplitude = rms;
+
+    // int num;
+    // if (status == "Idle")
+    //   num = 0;
+    // else if (status == "Normal")
+    //   num = 1;
+    // else
+    //   num = 2;
+
+    double X_1[] = {static_cast<double>(datEnergy.power), static_cast<double>(rms), static_cast<double>(datEnergy.current), static_cast<double>(maxFFT)};
+    int result = predict(X_1);
+
+    Serial.printf("Predicted: %d\n", result);
+
+    xQueueSend(Queue_Vreal, &feature, 0);
     xQueueSend(Queue_dataFFT, &dat, 0);
     esp_task_wdt_reset();
     vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -429,12 +458,17 @@ void readIMU(void *pvParameter)
 
 String klasifikasiKeausan(double rms, double maxFFT, float arus, float tof)
 {
-  if (arus < 1.6 && tof > 17) {
+  if (arus < 1.6 && tof > 17)
+  {
     return "Idle";
-  } else if (rms < 30.0 && maxFFT < 800.0) {
-    return "Normal"; 
-  } else {
-    return "Aus"; 
+  }
+  else if (rms < 30.0 && maxFFT < 800.0)
+  {
+    return "Normal";
+  }
+  else
+  {
+    return "Aus";
   }
 }
 
