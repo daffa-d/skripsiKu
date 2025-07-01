@@ -35,6 +35,7 @@
 // Peripheral
 #define SSR 2
 #define BUZZER 35
+#define SAMPLE_PREDICT 3
 
 TwoWire Peripheral_Sensor = TwoWire(1);
 MPU6050 mpu(MPU6050_I2C_ADDR, &Peripheral_Sensor);
@@ -53,6 +54,7 @@ QueueHandle_t Queue_predict;
 QueueHandle_t Queue_resultPredict;
 SemaphoreHandle_t xSemaphore = NULL;
 TaskHandle_t ToF_Task_Handle = NULL;
+TaskHandle_t ML_Task_Handle = NULL;
 
 const int START_BIN = 5;
 const int END_BIN = 50;
@@ -203,6 +205,7 @@ void setup()
   /* Making sure it worked (returns 0 if so) */
   if (devStatus == 0)
   {
+    digitalWrite(BUZZER, HIGH);
     mpu.CalibrateAccel(6); // Calibration Time: generate offsets and calibrate our MPU6050
     mpu.CalibrateGyro(6);
     mpu.setDMPEnabled(true);
@@ -229,24 +232,24 @@ void setup()
     // 1 = initial memory load failed
     // 2 = DMP configuration updates failed
   }
-  digitalWrite(BUZZER, HIGH);
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
-  digitalWrite(BUZZER, LOW);
-  digitalWrite(SSR, HIGH);
   esp_task_wdt_deinit();
   esp_task_wdt_init(30, true);
-
+  
   Queue_dataPzem = xQueueCreate(10, sizeof(dataPzem));
   Queue_dataToF = xQueueCreate(10, sizeof(float));
   Queue_dataFFT = xQueueCreate(10, sizeof(dataFFT));
   Queue_predict = xQueueCreate(10, sizeof(char[16]));
   Queue_resultPredict = xQueueCreate(10, sizeof(int));
+  xSemaphore = xSemaphoreCreateBinary();
+  
+  digitalWrite(BUZZER, LOW);
+  digitalWrite(SSR, HIGH);
 
   xTaskCreate(readPZEM, "readPZEM", 4096, NULL, 1, NULL);
   // xTaskCreate(readToF, "readToF", 4096, NULL, 1, NULL);
   xTaskCreate(screenDisplay, "screenDisplay", 8192 * 2, NULL, 1, NULL);
   xTaskCreate(readIMU, "readIMU", 8192 * 8, NULL, 2, NULL);
-  xTaskCreate(mlPredict, "mlPredict", 8192 * 2, NULL, 2, NULL);
+  xTaskCreate(mlPredict, "mlPredict", 8192 * 2, NULL, 2, &ML_Task_Handle);
 }
 
 void loop()
@@ -279,7 +282,7 @@ void mlPredict(void *pvParameter)
       vTaskDelay(5000 / portTICK_PERIOD_MS);
       stateStartEngine = true;
       idx = 0;
-      for (int i = 0; i < 3; i++)
+      for (int i = 0; i < SAMPLE_PREDICT; i++)
       {
         countPredict[i] = 0;
       }
@@ -299,14 +302,14 @@ void mlPredict(void *pvParameter)
       vTaskDelay(100 / portTICK_PERIOD_MS);
       continue;
     }
-    float X_1[] = {datEnergy.power, datFFT.rmsAmplitude, datFFT.maxAmplitude, datFFT.maxFFT};
+    float X_1[] = {datFFT.rmsAmplitude, datEnergy.current, datFFT.maxAmplitude};
     int result = predict(X_1);
     // Serial.printf("%.02f, %.02f, %.02f, %.02f, %.02f, \n", datEnergy.power, datFFT.rmsAmplitude, datEnergy.current, datFFT.maxAmplitude, datFFT.maxFFT);
     Serial.printf("Result: %d Power:%.02f RMS: %.02f Curent: %.02f MaxAmp: %.02f, FFT: %.02f\n", result, datEnergy.power, datFFT.rmsAmplitude, datEnergy.current, datFFT.maxAmplitude, datFFT.maxFFT);
     countPredict[idx++] = result;
     xQueueSend(Queue_resultPredict, &result, 0);
 
-    if (idx >= 3)
+    if (idx >= SAMPLE_PREDICT)
     {
       if (countPredict[0] == 0 && countPredict[1] == 0 && countPredict[2] == 0)
       {
@@ -314,7 +317,6 @@ void mlPredict(void *pvParameter)
         xQueueSend(Queue_predict, &status, 0);
         endPredict = true;
         xTaskCreate(readToF, "readToF", 4096, NULL, 1, NULL);
-        vTaskDelete(NULL);
       }
       else if (countPredict[0] == 1 && countPredict[1] == 1 && countPredict[2] == 1)
       {
@@ -324,15 +326,16 @@ void mlPredict(void *pvParameter)
         for (int i = 0; i < 3; i++)
         {
           digitalWrite(BUZZER, HIGH);
-          vTaskDelay(1000 / portTICK_PERIOD_MS);
+          vTaskDelay(2000 / portTICK_PERIOD_MS);
           digitalWrite(BUZZER, LOW);
-          vTaskDelay(1000 / portTICK_PERIOD_MS);
+          vTaskDelay(2000 / portTICK_PERIOD_MS);
         }
         endPredict = true;
       }
       else
       {
-        strcpy(status, "Idle");
+        strcpy(status, "Calculate");
+        xQueueSend(Queue_predict, &status, 0);
       }
       idx = 0;
     }
@@ -414,13 +417,12 @@ void screenDisplay(void *pvParameter)
       display.print(buff);
       display.drawLine(64, 14, 64, 55, 1);
       display.setCursor(66, 17);
-      sprintf(buff, "I: %.1fA", datEnergy.current);
+      sprintf(buff, "I: %.2fA", datEnergy.current);
       display.print(buff);
       display.setCursor(1, 35);
       sprintf(buff, "T: %.1fcm", distance / 10);
       display.print(buff);
       display.setCursor(1, 57);
-      display.print("Klasifikasi: ");
       display.println(KlasifikasiStatus);
       display.setCursor(66, 35);
       display.print(DMPReady ? "IMU: OK" : "IMU: ERR");
@@ -445,6 +447,7 @@ void screenDisplay(void *pvParameter)
     else if (stateAus)
     {
       display.drawBitmap(27, 8, image_download_bits, 16, 16, 1);
+      display.drawBitmap(78, 8, image_download_bits, 16, 16, 1);
       display.setTextColor(1);
       display.setTextWrap(false);
       display.setCursor(51, 13);
@@ -453,7 +456,6 @@ void screenDisplay(void *pvParameter)
       display.print("SEGERA LAKUKAN ");
       display.setCursor(13, 39);
       display.print("PENGGANTIAN MATA");
-      display.drawBitmap(78, 8, image_download_bits, 16, 16, 1);
       display.setCursor(41, 52);
       display.print("GERINDA");
 
@@ -496,7 +498,6 @@ void readToF(void *pvParameter)
   esp_task_wdt_add(NULL);
   for (;;)
   {
-    esp_task_wdt_reset();
     tof.rangingTest(&measure, false);
     if (measure.RangeStatus != 4)
       distance = measure.RangeMilliMeter;
@@ -536,13 +537,10 @@ void readIMU(void *pvParameter)
       else
       {
         MPUIntStatus = mpu.getIntStatus();
-        if (MPUIntStatus & MPU6050_INTERRUPT_FIFO_OFLOW_BIT)
-        {
-          mpu.resetFIFO();
-        }
+        if (MPUIntStatus & MPU6050_INTERRUPT_FIFO_OFLOW_BIT) mpu.resetFIFO();
       }
-
       float accelx_ms2 = aaReal.x * mpu.get_acce_resolution() * EARTH_GRAVITY_MS2;
+      // Serial.println(accelx_ms2);
       if (isnan(accelx_ms2))
         errorRetry++;
       else
